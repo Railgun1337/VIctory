@@ -30,6 +30,8 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    /// How many dynamic slots this heap has past the title's.
+    dynamic_cap: u32,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -64,6 +66,10 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// took until it is reset (its submissions have run) or released.
 const DYNAMIC: u32 = 1 << 16;
 
+/// Larger dynamic pool tried first on tier-3 hardware (no descriptor count
+/// limit), where 65536 exhausts on the world's first frame.
+const DYNAMIC_LARGE: u32 = 1 << 20;
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -84,18 +90,32 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count) = match make(count + extra) {
-            Ok(heap) => (heap, count),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
-            }
-            Err(e) => {
+        let (heap, count, dynamic_cap) = if sampler {
+            (make(count).map_err(|e| {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                return None;
+                e
+            }).ok()?, count, 0u32)
+        } else {
+            // On tier-3 hardware (WARP, most modern GPUs) the descriptor heap
+            // limit is not 1 M, so try a much larger dynamic pool first.
+            match make(count + DYNAMIC_LARGE) {
+                Ok(heap) => {
+                    tracing::debug!(dynamic = DYNAMIC_LARGE, "host view heap with large dynamic pool");
+                    (heap, count, DYNAMIC_LARGE)
+                }
+                Err(_) => match make(count + DYNAMIC) {
+                    Ok(heap) => (heap, count, DYNAMIC),
+                    Err(e) if count + DYNAMIC > PORTABLE_VIEWS => {
+                        // shortcut: descriptors past the host's limit are left out;
+                        // a title that reaches them needs remapping.
+                        tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+                        (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - DYNAMIC, DYNAMIC)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                        return None;
+                    }
+                },
             }
         };
         // SAFETY: a live heap.
@@ -110,7 +130,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(count + dynamic_cap) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -121,15 +141,16 @@ impl HostHeap {
             count,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
+            kept: Mutex::new(vec![None; (count + dynamic_cap) as usize]),
+            next: Mutex::new((0, vec![false; dynamic_cap as usize])),
+            dynamic_cap,
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra) {
+        if let Err(e) = h.fill_null(kind, count + dynamic_cap) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
@@ -201,14 +222,15 @@ impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > DYNAMIC {
+        if self.sampler || n == 0 || n > self.dynamic_cap {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
+        let cap = self.dynamic_cap as usize;
         // Search from `next` on, then from the start.
-        let starts = (*next as usize..DYNAMIC as usize).chain(0..*next as usize);
+        let starts = (*next as usize..cap).chain(0..*next as usize);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -230,7 +252,7 @@ impl HostHeap {
             return None;
         };
         taken[first..first + n].fill(true);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % cap) as u32;
         Some(self.count + first as u32)
     }
 
@@ -249,7 +271,7 @@ impl HostHeap {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(DYNAMIC) as usize;
+        let end = (at + n).min(self.dynamic_cap) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             slots.fill(false);
         }
@@ -862,13 +884,14 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let a = heap.dynamic(DYNAMIC - 100).unwrap();
+        let cap = heap.dynamic_cap;
+        let a = heap.dynamic(cap - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + DYNAMIC - 100));
+        assert_eq!((a, b), (4, 4 + cap - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+        assert_eq!(heap.dynamic(40), Some(4 + cap - 40));
     }
 }
